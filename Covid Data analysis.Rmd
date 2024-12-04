@@ -1,0 +1,199 @@
+---
+title: "Covid Data Analysis"
+author: "Catherine Haynes"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Import libraries
+
+Note: To knit, please make sure you have the following libraries installed:
+
+- sp
+- spdep
+- tidyverse
+- dplyr
+- ggplot2
+- ggmap
+
+``` {r, echo=TRUE}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(ggmap)
+```
+
+
+### Import the Covid Case Data
+
+``` {r, echo=TRUE}
+covid_url <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/refs/heads/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_confirmed_US.csv"
+covid <- read_csv(covid_url)
+```
+
+This data contains case counts for the Covid-19 pandemic. These counts are reported by day and city. 
+
+### Preview the data
+
+``` {r, echo=TRUE}
+head(covid, 10)
+```
+
+Each date is shown as its own column. We will pivot the table so that all dates are listed in one column and the values associated with them become a new column as well. 
+
+``` {r, echo=TRUE}
+covid_long <- pivot_longer(covid, 
+                           cols = -c('UID', 'iso2', 'iso3', 'code3', 'FIPS', 'Admin2', 'Province_State', 'Country_Region', 'Lat', 'Long_', 'Combined_Key'),
+                           names_to = "Date",
+                           values_to = "Count")
+
+covid_long
+```
+### Update and Remove Uneeded Columns
+
+``` {r, echo=FALSE}
+summary(covid_long)
+```
+
+``` {r, echo=TRUE}
+#remove unwanted columns
+covid_long <- covid_long %>%
+  select(-c('UID', 'iso2', 'iso3', 'code3', 'FIPS'))
+```
+
+``` {r, echo=TRUE}
+#update data types
+covid_long$Date <- as.Date(covid_long$Date, format = "%m/%d/%y")
+
+summary(covid_long)
+```
+
+### Question of Interest
+
+Are there seasonal trends in Covid-19 cases? We will use data between 1-22-2020 - 1-8-2023 so that we are looking at three complete years. 
+
+``` {r, echo=TRUE}
+#Remove dates after 1-8-2023 so we have 3 complete years of data
+cutoff_date <- as.Date("2023-01-08")
+covid_3years <- covid_long[covid_long$Date <= cutoff_date, ]
+
+summary(covid_3years)
+```
+``` {r, echo=TRUE}
+#create a season column
+
+covid_3years <- covid_3years %>%
+  mutate(Season = case_when(
+    Date >= as.Date(paste(year(Date), 3, 20, sep = "-")) & Date < as.Date(paste(year(Date), 6, 21, sep = "-")) ~ "Spring",
+    Date >= as.Date(paste(year(Date), 6, 21, sep = "-")) & Date < as.Date(paste(year(Date), 9, 23, sep = "-")) ~ "Summer",
+    Date >= as.Date(paste(year(Date), 9, 23, sep = "-")) & Date < as.Date(paste(year(Date), 12, 21, sep = "-")) ~ "Fall",
+    TRUE ~ "Winter"
+  ))
+
+print(covid_3years)
+```
+
+```{r, echo=TRUE}
+#create new column for new cases by day
+
+covid_3years <- covid_3years %>%
+  group_by(Combined_Key) %>%
+  arrange(Date) %>%
+  mutate(New_Cases = Count - lag(Count, default = 0)) %>%
+  ungroup()
+
+print(covid_3years)
+```
+
+```{r, echo = TRUE}
+#create a bar graph that show total cases by season
+season_summary <- covid_3years %>%
+  group_by(Season) %>%
+  summarize(Total_New_Cases = sum(New_Cases, na.rm = TRUE))
+
+#set order of seasons
+season_summary$Season <- factor(season_summary$Season,
+                                levels = c("Spring", "Summer", "Fall", "Winter"))
+
+ggplot(data = season_summary, aes(x=Season, y= Total_New_Cases, fill=Season)) +
+  geom_bar(stat = "identity") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Seasonal Covid-19 Cases", x = "Season", y= "Total New Cases")+
+  scale_fill_manual(values = c("Spring" = "green", "Summer" = "yellow", "Fall" = "orange", "Winter" = "blue"))
+```
+
+Including three years of data, Winter showed the highest total of cases. Spring showed the fewest total cases. 
+
+### Prevelance of Cases by Season and Location
+
+By season, we are now going to look at the prevalence of cases in different locations in the continental US.
+
+```{r, echo=TRUE}
+filtered_lat <- covid_3years %>%
+  filter(Long_ <-65 & Long_ >-130 , Lat >24 & Lat <50)
+
+city_summary <- filtered_lat %>%
+  group_by(Admin2, Province_State, Lat, Long_, Season) %>%
+  summarize(Total_New_Cases = sum(New_Cases, na.rm = TRUE), .groups = 'drop')
+
+us_map <- map_data("state")
+
+seasons <- unique(city_summary$Season)
+
+for (season in seasons) {
+  season_data <- city_summary %>%
+    filter(Season == season)
+  
+  ggplot() +
+    geom_polygon(data = us_map, aes(x= long, y= lat, group = group), fill = 'grey85', color = 'black') +
+    geom_point(data = season_data, aes(x=Long_, y=Lat, size = Total_New_Cases, color = Total_New_Cases), color = "red", alpha = 0.6) +
+    scale_size_continuous(name = "Total Cases", range = c(0.05,5), labels=scales::comma) +
+    labs(title = paste("Total Covid-19 Cases by City -", season), x="Longitude", y = "Latitude") +
+    theme(legend.position = "right") +
+    coord_fixed()
+  
+  print(last_plot())
+}
+```
+
+Most cities follow the same trends we saw cumulatively- the number of cases are smallest in spring compared to the other three seasons. 
+
+### Model and Analysis Using Moran's I
+
+```{r, echo=TRUE}
+library(sp)
+library(spdep)
+
+for (season in unique(city_summary$Season)) {
+  
+  season_groups <- city_summary %>%
+    filter(Season == season)
+  
+  coordinates(season_groups) <- ~ Long_ + Lat
+  
+  neighbors <- knn2nb(knearneigh(coordinates(season_groups), k=4))
+
+  listw <- nb2listw(neighbors, style = "W")
+
+  cases <- season_groups$Total_New_Cases
+  
+  moran_test <- moran.test(cases, listw)
+
+  cat(paste("Moran's I Test for", season, "\n"))
+  print(moran_test)
+  cat("\n")
+}
+```
+All positive Moran 1 Statistics indicate that there is a tendency for cases to group together spatially. So, if a city has a high number of cases, it is also likely for surrounding areas to have high numbers. This is most true in Spring, then Fall, Winter, and finally, Summer. 
+
+### Conclusion and Bias
+
+Based on the analysis, there was a significant difference for the total number of cases reported for each season. Looking at three years worth of data, the most cases were reported in Winter, with over 40 million. Summer and Fall each had about 23 million cases reported over the three year span. Spring had the least amount of cases reported with under 15 million. Looking at the data spacially, we see most cities following this same trend. Lastly, after creating a Moran I model, all seasons showed a positive spatial autocorrelation, meaning that there is a strong correlation between a city having a large number of cases and surrounding areas also having a large number of cases. The strongest correlation was present during Spring. 
+
+There is potential for bias in Covid data because the analysis only covers reported cases. There are a large number of cases that were never reported and some populations of people that are underrepresented in the data, like rural communities. This can impact our analysis, but our findings likely represent the change in cases by season accurately because cases were likely underreportted in all seasons. 
